@@ -8,7 +8,7 @@ from dataclasses import dataclass
 
 from tts_robust_normalizer_single_script import normalize_tts_text
 
-ENGLISH_VOICES = frozenset({"Trump", "Ava", "Bella", "Adam", "Nathan"})
+ENGLISH_VOICES = frozenset({"Trump", "Ava", "Bella", "Adam", "Nathan", "Jarvis"})
 CUSTOM_ZH_WETEXT_CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "wetext_zh_no_erhua_keep_punct"
 _ZH_WETEXT_KEEP_HYPHEN = "___KEEP_HYPHEN_BEFORE_ZH_WETEXT___"
 

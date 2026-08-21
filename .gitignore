@@ -134,6 +134,7 @@ __pycache__/
 
 # models
 *.pkl
+models/
 
 # *.wav
 # *.flac
