@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import io
 import json
 import logging
 import os
 import queue
+import re
+import struct
 import tempfile
 import threading
 import time
@@ -20,7 +23,7 @@ from typing import Callable, Iterator, Optional, Sequence, TypeVar
 import numpy as np
 import torch
 import uvicorn
-from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 
 from moss_tts_nano_runtime import (
@@ -446,6 +449,557 @@ class StreamingJobManager:
     def delete(self, stream_id: str) -> StreamingJob | None:
         with self._lock:
             return self._jobs.pop(stream_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Agent 流式 TTS：增量分段器
+# 把 Agent 的 token 增量文本切成可合成的小句，投递给 TtsSession 合成队列。
+# 切分优先级：句末符命中 > 长度兜底（软切）> 超时兜底（强切）> flush/finish。
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Segment:
+    """一个可合成的句段。"""
+
+    index: int          # 句序号，从 0 递增
+    text: str           # 已归一化、已过滤的可合成文本
+    is_first: bool      # 是否首句（影响首音延迟优化）
+    is_flushed: bool    # 是否由显式 flush / finish 触发（末句）
+
+
+# 句末标点（中英），命中则成句
+_SENTENCE_ENDINGS = "。！？；… .!?;\n"
+# 软切分点（长度兜底时优先在此切）
+_SOFT_BREAKS = "，、, "
+# 需剥离的 markdown/装饰符号
+_MARKDOWN_STRIP_CHARS = "*_`#>~|"
+# 代码块围栏：仅匹配整行 ``` 或 ```lang
+_CODE_FENCE_RE = re.compile(r"^```[\w-]*$")
+
+
+class IncrementalSegmenter:
+    """Agent token 流 → 句段流。线程安全（单 feed 协程驱动，timer 另起）。"""
+
+    def __init__(
+        self,
+        *,
+        first_segment_max_chars: int = 24,
+        segment_max_chars: int = 60,
+        segment_idle_timeout_ms: int = 800,
+        strip_non_speech: bool = True,
+        sentence_endings: str = _SENTENCE_ENDINGS,
+        soft_breaks: str = _SOFT_BREAKS,
+    ) -> None:
+        self.first_segment_max_chars = max(4, int(first_segment_max_chars))
+        self.segment_max_chars = max(self.first_segment_max_chars, int(segment_max_chars))
+        self.segment_idle_timeout_ms = max(0, int(segment_idle_timeout_ms))
+        self.strip_non_speech = bool(strip_non_speech)
+        self.sentence_endings = sentence_endings
+        self.soft_breaks = soft_breaks
+
+        self._buffer: list[str] = []          # 未成句的 token 缓冲
+        self._buffer_len: int = 0
+        self._index: int = 0                   # 已产出句序号
+        self._last_feed_at: float = time.monotonic()
+        self._lock = threading.Lock()
+        self._cancelled = False
+
+    # ---- 内部：内容过滤 ----
+    def _strip_non_speech(self, text: str) -> str:
+        """剥离 markdown 装饰符号；代码块整体跳过。"""
+        if not self.strip_non_speech:
+            return text
+        cleaned_lines: list[str] = []
+        in_code_block = False
+        for raw_line in text.split("\n"):
+            line = raw_line.strip()
+            if not line:
+                continue
+            # 代码块围栏：仅当整行是 ``` 或 ```lang 时才切换状态
+            if _CODE_FENCE_RE.match(line):
+                in_code_block = not in_code_block
+                continue
+            if in_code_block:
+                # 代码块内容整体跳过
+                continue
+            stripped = line.lstrip(_MARKDOWN_STRIP_CHARS + " ")
+            if stripped:
+                cleaned_lines.append(stripped)
+        joined = " ".join(cleaned_lines)
+        # 去掉行内成对装饰符号 **bold** _em_ `code`
+        for ch in _MARKDOWN_STRIP_CHARS:
+            joined = joined.replace(ch, "")
+        return joined.strip()
+
+    # ---- 内部：切分核心 ----
+    def _current_threshold(self) -> int:
+        return self.first_segment_max_chars if self._index == 0 else self.segment_max_chars
+
+    def _try_cut_by_ending(self) -> str | None:
+        """若缓冲含句末符，切出第一个句。返回切出的文本或 None。"""
+        if not self._buffer:
+            return None
+        text = "".join(self._buffer).strip()
+        if not text:
+            self._buffer.clear()
+            self._buffer_len = 0
+            return None
+        # 找第一个句末符位置（逐句切，配合 while 循环处理多句）
+        cut_pos = -1
+        for i in range(len(text)):
+            if text[i] in self.sentence_endings:
+                cut_pos = i
+                break
+        if cut_pos < 0:
+            return None
+        sentence = text[: cut_pos + 1].strip()
+        rest = text[cut_pos + 1 :]
+        self._buffer = [rest] if rest else []
+        self._buffer_len = len(rest)
+        return sentence or None
+
+    def _try_cut_by_length(self) -> str | None:
+        """长度兜底：缓冲超阈值时，优先在最近的软切点切；无软切点则硬切。"""
+        if self._buffer_len < self._current_threshold():
+            return None
+        text = "".join(self._buffer)
+        # 找阈值范围内最后一个软切点
+        cut_pos = -1
+        scan_limit = min(len(text), self._current_threshold() + 8)
+        for i in range(scan_limit - 1, -1, -1):
+            if text[i] in self.soft_breaks:
+                cut_pos = i
+                break
+        if cut_pos < 1:
+            cut_pos = self._current_threshold()  # 硬切
+        sentence = text[: cut_pos + 1].strip()
+        rest = text[cut_pos + 1 :]
+        self._buffer = [rest] if rest else []
+        self._buffer_len = len(rest)
+        return sentence or None
+
+    def _emit(self, raw_text: str) -> Segment | None:
+        cleaned = self._strip_non_speech(raw_text)
+        if not cleaned:
+            return None
+        seg = Segment(
+            index=self._index,
+            text=cleaned,
+            is_first=(self._index == 0),
+            is_flushed=False,
+        )
+        self._index += 1
+        return seg
+
+    def _drain_buffer(self, is_flushed: bool) -> list[Segment]:
+        """强制清空缓冲成句（flush / finish 用）。"""
+        if not self._buffer:
+            return []
+        text = "".join(self._buffer).strip()
+        self._buffer.clear()
+        self._buffer_len = 0
+        if not text:
+            return []
+        cleaned = self._strip_non_speech(text)
+        if not cleaned:
+            return []
+        seg = Segment(
+            index=self._index,
+            text=cleaned,
+            is_first=(self._index == 0),
+            is_flushed=is_flushed,
+        )
+        self._index += 1
+        return [seg]
+
+    # ---- 公开 API ----
+    def feed(self, delta: str) -> list[Segment]:
+        """Agent 喂入 token 增量；返回本次新切出的 0..N 个句段。"""
+        if self._cancelled or not delta:
+            return []
+        with self._lock:
+            self._last_feed_at = time.monotonic()
+            self._buffer.append(delta)
+            self._buffer_len += len(delta)
+            results: list[Segment] = []
+            # 先试句末符，再试长度兜底（可能连续切多句）
+            while True:
+                cut = self._try_cut_by_ending() or self._try_cut_by_length()
+                if cut is None:
+                    break
+                seg = self._emit(cut)
+                if seg is not None:
+                    results.append(seg)
+            return results
+
+    def flush(self) -> list[Segment]:
+        """强制清空缓冲成句（段落/工具调用边界用）。"""
+        with self._lock:
+            return self._drain_buffer(is_flushed=True)
+
+    def finish(self) -> list[Segment]:
+        """文本结束，清空残余缓冲成末句（is_flushed=True）。"""
+        with self._lock:
+            return self._drain_buffer(is_flushed=True)
+
+    def check_idle_timeout(self) -> list[Segment]:
+        """超时兜底：距上次 feed 超过阈值则强切当前缓冲。由外部定时器调用。"""
+        if self._cancelled or self.segment_idle_timeout_ms <= 0 or not self._buffer:
+            return []
+        with self._lock:
+            elapsed_ms = (time.monotonic() - self._last_feed_at) * 1000.0
+            if elapsed_ms < self.segment_idle_timeout_ms:
+                return []
+            return self._drain_buffer(is_flushed=False)
+
+    def cancel(self) -> None:
+        """丢弃缓冲，停止切分。"""
+        with self._lock:
+            self._cancelled = True
+            self._buffer.clear()
+            self._buffer_len = 0
+
+
+# ---------------------------------------------------------------------------
+# Agent 流式 TTS：TtsSession
+# 一个 Agent 回合 = 一个 session。session 内多句共享同一 voice clone prompt，
+# 串行排队、顺序拼接成一条连续音频流。合成与下行/播放并行（流水线）。
+# ---------------------------------------------------------------------------
+
+
+# TTS 合成默认参数（与现有 /api/generate-stream 对齐，可被 extra_tts_params 覆盖）
+_DEFAULT_AGENT_TTS_PARAMS: dict[str, object] = {
+    "max_new_frames": 375,
+    "voice_clone_max_text_tokens": 75,
+    "tts_max_batch_size": 0,
+    "codec_max_batch_size": 0,
+    "attn_implementation": "model_default",
+    "do_sample": True,
+    "text_temperature": 1.0,
+    "text_top_p": 1.0,
+    "text_top_k": 50,
+    "audio_temperature": 0.8,
+    "audio_top_p": 0.95,
+    "audio_top_k": 25,
+    "audio_repetition_penalty": 1.2,
+    "seed": None,
+    "cpu_threads": 0,
+}
+
+
+@dataclass
+class _AgentAudioChunk:
+    """session 内部音频 chunk（未加帧头）。"""
+
+    pcm_bytes: bytes
+    sample_rate: int
+    channels: int
+    seq: int
+    is_boundary: bool      # 句末边界
+    is_silence: bool       # 句间静音
+
+
+class TtsSession:
+    """串行调度多句合成 → 连续音频流。状态机：created→running→draining→ended｜cancelled。"""
+
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        runtime_manager: "RequestRuntimeManager",
+        text_normalizer_manager,
+        warmup_manager,
+        prompt_audio_path: str,
+        prompt_audio_display_path: str,
+        prompt_audio_cleanup_path: str | None,
+        segmenter: IncrementalSegmenter,
+        extra_tts_params: dict | None = None,
+        insert_inter_silence_ms: int = 120,
+        on_audio: Callable[[_AgentAudioChunk], None],
+        on_sentence: Callable[[int, str, bool], None],
+        on_error: Callable[[str, bool], None],
+        on_ended: Callable[[str], None],
+    ) -> None:
+        self.session_id = session_id
+        self._runtime_manager = runtime_manager
+        self._text_normalizer_manager = text_normalizer_manager
+        self._warmup_manager = warmup_manager
+        self._prompt_audio_path = prompt_audio_path
+        self._prompt_audio_display_path = prompt_audio_display_path
+        self._prompt_audio_cleanup_path = prompt_audio_cleanup_path
+        self._segmenter = segmenter
+        self._tts_params = {**_DEFAULT_AGENT_TTS_PARAMS, **(extra_tts_params or {})}
+        self.insert_inter_silence_ms = max(0, int(insert_inter_silence_ms))
+
+        self._on_audio = on_audio
+        self._on_sentence = on_sentence
+        self._on_error = on_error
+        self._on_ended = on_ended
+
+        self._lock = threading.Lock()
+        self._state = "created"             # created|running|draining|ended|cancelled
+        self._seg_queue: "queue.Queue[Segment | None]" = queue.Queue(maxsize=64)
+        self._worker: threading.Thread | None = None
+        self._seq = 0                        # 音频帧序号
+        self._sample_rate = 24000            # 默认，合成时被实际值覆盖
+        self._channels = 1
+        self._started_at: float | None = None
+        self._first_audio_at: float | None = None
+        self._emitted_audio_seconds = 0.0
+        self._sentence_count = 0
+        self._cancelled = False
+
+    @property
+    def state(self) -> str:
+        with self._lock:
+            return self._state
+
+    @property
+    def sample_rate(self) -> int:
+        return self._sample_rate
+
+    @property
+    def channels(self) -> int:
+        return self._channels
+
+    # ---- 状态机内部 ----
+    def _set_state(self, state: str) -> None:
+        with self._lock:
+            self._state = state
+
+    def _is_cancelled(self) -> bool:
+        with self._lock:
+            return self._cancelled
+
+    # ---- 公开 API ----
+    def start(self) -> None:
+        """预热检查后置 running，启动合成 worker 线程。"""
+        warmup_snapshot = self._warmup_manager.snapshot()
+        if not warmup_snapshot.ready:
+            warmup_snapshot = self._warmup_manager.ensure_ready()
+            if not warmup_snapshot.ready:
+                self._on_error(f"warmup not ready: {_warmup_status_text(warmup_snapshot)}", fatal=True)
+                self._set_state("ended")
+                self._on_ended("error")
+                return
+        self._set_state("running")
+        self._started_at = time.monotonic()
+        self._worker = threading.Thread(
+            target=self._run_worker,
+            name=f"agent-tts-{self.session_id}",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def feed_text(self, delta: str) -> None:
+        """WS text 帧入口 → segmenter.feed → 入合成队列。"""
+        if self._is_cancelled() or self.state not in {"running", "draining"}:
+            return
+        for seg in self._segmenter.feed(delta):
+            self._enqueue_segment(seg)
+
+    def flush(self) -> None:
+        """WS flush 帧 → segmenter.flush → 入队。"""
+        if self._is_cancelled():
+            return
+        for seg in self._segmenter.flush():
+            self._enqueue_segment(seg)
+
+    def stop(self) -> None:
+        """WS stop 帧 → segmenter.finish → 置 draining，合成完末句后 ended。"""
+        if self._is_cancelled():
+            return
+        self._set_state("draining")
+        for seg in self._segmenter.finish():
+            self._enqueue_segment(seg)
+        # 哨兵：worker 取到 None 即知文本结束
+        try:
+            self._seg_queue.put_nowait(None)
+        except queue.Full:
+            pass
+
+    def cancel(self) -> None:
+        """WS cancel / 断开 → 置 cancelled，worker 在检查点退出，清理。"""
+        with self._lock:
+            if self._state in {"ended", "cancelled"}:
+                return
+            self._cancelled = True
+            self._state = "cancelled"
+        self._segmenter.cancel()
+        # 唤醒 worker
+        try:
+            self._seg_queue.put_nowait(None)
+        except queue.Full:
+            pass
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            first_audio_latency = (
+                None
+                if self._started_at is None or self._first_audio_at is None
+                else max(0.0, self._first_audio_at - self._started_at)
+            )
+            return {
+                "session_id": self.session_id,
+                "state": self._state,
+                "sample_rate": self._sample_rate,
+                "channels": self._channels,
+                "emitted_audio_seconds": self._emitted_audio_seconds,
+                "sentence_count": self._sentence_count,
+                "first_audio_latency_seconds": first_audio_latency,
+            }
+
+    # ---- 内部 ----
+    def _enqueue_segment(self, seg: Segment) -> None:
+        if self._is_cancelled():
+            return
+        while True:
+            if self._is_cancelled():
+                return
+            try:
+                self._seg_queue.put(seg, timeout=0.1)
+                return
+            except queue.Full:
+                continue
+
+    def _next_seq(self) -> int:
+        with self._lock:
+            seq = self._seq
+            self._seq += 1
+            return seq
+
+    def _emit_audio(self, pcm_bytes: bytes, sample_rate: int, channels: int, *, is_boundary: bool, is_silence: bool) -> None:
+        if not pcm_bytes:
+            return
+        with self._lock:
+            if self._first_audio_at is None and not is_silence:
+                self._first_audio_at = time.monotonic()
+            self._sample_rate = sample_rate
+            self._channels = channels
+            if not is_silence and sample_rate > 0:
+                self._emitted_audio_seconds += len(pcm_bytes) / (sample_rate * channels * 2)
+        chunk = _AgentAudioChunk(
+            pcm_bytes=pcm_bytes,
+            sample_rate=sample_rate,
+            channels=channels,
+            seq=self._next_seq(),
+            is_boundary=is_boundary,
+            is_silence=is_silence,
+        )
+        self._on_audio(chunk)
+
+    def _emit_silence(self, sample_rate: int, channels: int, duration_ms: int) -> None:
+        if duration_ms <= 0:
+            return
+        num_samples = int(sample_rate * channels * duration_ms / 1000.0)
+        # PCM s16le 静音 = 全零字节
+        silence_bytes = b"\x00" * (num_samples * 2)
+        self._emit_audio(silence_bytes, sample_rate, channels, is_boundary=False, is_silence=True)
+
+    def _resolve_attn(self, selected_runtime: "NanoTTSService", requested_attn: str) -> str:
+        normalized = str(requested_attn or "model_default").strip().lower()
+        if selected_runtime.device.type != "cpu":
+            return requested_attn
+        if normalized in {"", "auto", "default", "model_default", "flash_attention_2"}:
+            return "eager"
+        return requested_attn
+
+    def _synthesize_one_sentence(self, seg: Segment) -> None:
+        """串行合成单句 → 下行 PCM chunk。"""
+        if self._is_cancelled():
+            return
+        # 文本归一化（复用现有管道）
+        try:
+            prepared = shared_prepare_tts_request_texts(
+                text=seg.text,
+                enable_wetext=self._text_normalizer_manager is not None,
+                enable_normalize_tts_text=True,
+                text_normalizer_manager=self._text_normalizer_manager,
+            )
+            synth_text = str(prepared["text"])
+        except Exception:
+            logging.warning("agent-tts: text normalization failed, using raw segment", exc_info=True)
+            synth_text = seg.text
+
+        # 通知句边界
+        self._on_sentence(seg.index, seg.text, seg.is_first)
+        with self._lock:
+            self._sentence_count += 1
+
+        params = self._tts_params
+
+        def _stream_factory(selected_runtime: "NanoTTSService"):
+            return selected_runtime.synthesize_stream(
+                text=synth_text,
+                mode="voice_clone",
+                voice=None,
+                prompt_audio_path=self._prompt_audio_path,
+                max_new_frames=int(params["max_new_frames"]),
+                voice_clone_max_text_tokens=int(params["voice_clone_max_text_tokens"]),
+                tts_max_batch_size=int(params["tts_max_batch_size"]),
+                codec_max_batch_size=int(params["codec_max_batch_size"]),
+                attn_implementation=self._resolve_attn(selected_runtime, str(params["attn_implementation"])),
+                do_sample=bool(params["do_sample"]),
+                text_temperature=float(params["text_temperature"]),
+                text_top_p=float(params["text_top_p"]),
+                text_top_k=int(params["text_top_k"]),
+                audio_temperature=float(params["audio_temperature"]),
+                audio_top_p=float(params["audio_top_p"]),
+                audio_top_k=int(params["audio_top_k"]),
+                audio_repetition_penalty=float(params["audio_repetition_penalty"]),
+                seed=params["seed"],
+            )
+
+        try:
+            for event, _resolved_device, _resolved_cpu_threads in self._runtime_manager.iter_with_runtime(
+                requested_execution_device="cpu",
+                cpu_threads=int(params["cpu_threads"]),
+                factory=_stream_factory,
+            ):
+                if self._is_cancelled():
+                    break
+                event_type = str(event.get("type", ""))
+                if event_type != "audio":
+                    continue
+                waveform_numpy = np.asarray(event["waveform_numpy"], dtype=np.float32)
+                pcm_bytes = _audio_to_pcm16le_bytes(waveform_numpy)
+                if not pcm_bytes:
+                    continue
+                sample_rate = int(event["sample_rate"])
+                channels = 1 if waveform_numpy.ndim == 1 else int(waveform_numpy.shape[1])
+                is_pause = bool(event.get("is_pause", False))
+                self._emit_audio(pcm_bytes, sample_rate, channels, is_boundary=is_pause, is_silence=is_pause)
+        except Exception as exc:
+            logging.exception("agent-tts: sentence synthesis failed (session=%s seg=%d)", self.session_id, seg.index)
+            # 单句失败不致命，跳过继续后续句
+            self._on_error(f"sentence {seg.index} failed: {exc}", fatal=False)
+
+        # 句间静音（韵律连续，避免爆音）
+        if not self._is_cancelled() and self.insert_inter_silence_ms > 0:
+            self._emit_silence(self._sample_rate, self._channels, self.insert_inter_silence_ms)
+
+    def _run_worker(self) -> None:
+        """合成 worker：串行消费分段队列。"""
+        try:
+            while True:
+                seg = self._seg_queue.get()
+                if seg is None:
+                    # 哨兵：stop() 已触发且队列排空
+                    break
+                if self._is_cancelled():
+                    break
+                self._synthesize_one_sentence(seg)
+        except Exception as exc:
+            logging.exception("agent-tts: worker crashed (session=%s)", self.session_id)
+            self._on_error(f"worker crashed: {exc}", fatal=True)
+        finally:
+            _maybe_delete_file(self._prompt_audio_cleanup_path)
+            with self._lock:
+                if self._state not in {"cancelled"}:
+                    self._state = "ended"
+            reason = "cancel" if self._is_cancelled() else "stop"
+            self._on_ended(reason)
 
 
 def _warmup_status_text(snapshot: WarmupSnapshot) -> str:
@@ -2708,6 +3262,262 @@ def _build_app(
         stream_jobs.delete(stream_id)
         _maybe_delete_file(audio_cleanup_path)
         return snapshot
+
+    # ===================================================================
+    # Agent 流式 TTS：WebSocket /v1/tts/stream
+    # 上行 JSON 文本帧：start/text/flush/stop/cancel/ping
+    # 下行：JSON 控制帧 + 二进制音频帧（16 字节 header + PCM payload）
+    # ===================================================================
+
+    # WS 音频帧 header：magic(1) ver(1) flags(1) seq(4 BE) sample_rate(4 BE) channels(1) payload_len(4 BE)
+    _WS_AUDIO_MAGIC = 0xA1
+    _WS_AUDIO_VER = 0x01
+    _WS_FLAG_LAST = 0x01
+    _WS_FLAG_SILENCE = 0x02
+    _WS_FLAG_BOUNDARY = 0x04
+
+    def _build_ws_audio_frame(chunk: "_AgentAudioChunk", is_last: bool = False) -> bytes:
+        flags = 0
+        if is_last:
+            flags |= _WS_FLAG_LAST
+        if chunk.is_silence:
+            flags |= _WS_FLAG_SILENCE
+        if chunk.is_boundary:
+            flags |= _WS_FLAG_BOUNDARY
+        header = struct.pack(
+            ">BBBBIIB",
+            _WS_AUDIO_MAGIC,
+            _WS_AUDIO_VER,
+            flags,
+            chunk.seq,
+            chunk.sample_rate,
+            chunk.channels,
+        )
+        payload_len = len(chunk.pcm_bytes)
+        header += struct.pack(">I", payload_len)
+        return header + chunk.pcm_bytes
+
+    async def _resolve_ws_prompt_audio(
+        *,
+        demo_id: str,
+        prompt_audio_b64: str,
+    ) -> tuple[str, str, str | None]:
+        """解析 WS start 帧的 prompt 音频来源。返回 (实际路径, 显示路径, 清理路径)。"""
+        # 优先 base64 上传
+        if prompt_audio_b64:
+            try:
+                raw = base64.b64decode(prompt_audio_b64)
+            except Exception as exc:
+                raise ValueError(f"invalid prompt_audio_b64: {exc}") from exc
+            fd, tmp_path = tempfile.mkstemp(suffix=".wav", prefix="ws_prompt_")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(raw)
+            except Exception:
+                _maybe_delete_file(tmp_path)
+                raise
+            return tmp_path, f"ws_upload:{Path(tmp_path).name}", tmp_path
+
+        # 否则用 demo
+        demo_entry = _resolve_demo_entry(demo_id) if demo_id else None
+        if demo_entry is None:
+            raise ValueError("demo_id is required unless prompt_audio_b64 is provided.")
+        return str(demo_entry.prompt_audio_path), demo_entry.prompt_audio_relative_path, None
+
+    @app.websocket("/v1/tts/stream")
+    async def agent_tts_stream(ws: WebSocket):
+        await ws.accept()
+        session: TtsSession | None = None
+        session_id = f"agent-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+        # 下行队列：JSON 控制帧（dict）与二进制音频帧（bytes）交替
+        out_queue: "queue.Queue[dict | bytes | None]" = queue.Queue(maxsize=256)
+        idle_timer_cancel = threading.Event()
+
+        async def _send_loop():
+            """从 out_queue 取帧，按类型发送。"""
+            loop = asyncio.get_running_loop()
+            while True:
+                item = await loop.run_in_executor(None, out_queue.get)
+                if item is None:
+                    break
+                try:
+                    if isinstance(item, dict):
+                        await ws.send_json(item)
+                    elif isinstance(item, bytes):
+                        await ws.send_bytes(item)
+                except Exception:
+                    # 客户端已断开，停止
+                    break
+
+        def _on_audio(chunk: "_AgentAudioChunk"):
+            try:
+                out_queue.put_nowait(_build_ws_audio_frame(chunk))
+            except queue.Full:
+                logging.warning("agent-tts ws: out_queue full, dropping audio frame (session=%s)", session_id)
+
+        def _on_sentence(index: int, text: str, is_first: bool):
+            try:
+                out_queue.put_nowait({"type": "sentence", "index": index, "text": text, "is_first": is_first})
+            except queue.Full:
+                pass
+
+        def _on_error(message: str, fatal: bool):
+            try:
+                out_queue.put_nowait({"type": "error", "code": "fatal" if fatal else "warn", "message": message, "fatal": fatal})
+            except queue.Full:
+                pass
+
+        def _on_ended(reason: str):
+            # 发 ended + 末帧 is_last 标记 + 哨兵停止 send_loop
+            try:
+                out_queue.put_nowait({"type": "ended", "reason": reason})
+            except queue.Full:
+                pass
+            # 发一个 is_last 的空音频帧通知端结束
+            end_chunk = _AgentAudioChunk(
+                pcm_bytes=b"",
+                sample_rate=session.sample_rate if session else 24000,
+                channels=session.channels if session else 1,
+                seq=session._next_seq() if session else 0,  # noqa: SLF001
+                is_boundary=False,
+                is_silence=False,
+            )
+            try:
+                out_queue.put_nowait(_build_ws_audio_frame(end_chunk, is_last=True))
+            except queue.Full:
+                pass
+            try:
+                out_queue.put_nowait(None)
+            except queue.Full:
+                pass
+
+        send_task = asyncio.create_task(_send_loop())
+
+        try:
+            # 等待 start 帧
+            start_msg = await ws.receive_text()
+            start_data = json.loads(start_msg)
+            if start_data.get("type") != "start":
+                await ws.send_json({"type": "error", "code": "protocol", "message": "first frame must be start", "fatal": True})
+                await ws.close(code=4003)
+                return
+
+            demo_id = str(start_data.get("demo_id", "")).strip()
+            prompt_audio_b64 = str(start_data.get("prompt_audio_b64", "")).strip()
+            try:
+                prompt_audio_path, prompt_audio_display, prompt_audio_cleanup = await _resolve_ws_prompt_audio(
+                    demo_id=demo_id,
+                    prompt_audio_b64=prompt_audio_b64,
+                )
+            except ValueError as exc:
+                await ws.send_json({"type": "error", "code": "bad_request", "message": str(exc), "fatal": True})
+                await ws.close(code=4002)
+                return
+
+            fmt = str(start_data.get("format", "pcm")).strip().lower()
+            if fmt != "pcm":
+                # P0 仅支持 PCM；Opus 留待 P2
+                await ws.send_json({"type": "error", "code": "unsupported", "message": f"format {fmt} not supported in P0, use pcm", "fatal": True})
+                await ws.close(code=4002)
+                return
+
+            segmenter = IncrementalSegmenter(
+                first_segment_max_chars=int(start_data.get("first_segment_max_chars", 24)),
+                segment_max_chars=int(start_data.get("segment_max_chars", 60)),
+                segment_idle_timeout_ms=int(start_data.get("segment_idle_timeout_ms", 800)),
+                strip_non_speech=_coerce_bool(start_data.get("strip_non_speech", "1"), True),
+            )
+            session = TtsSession(
+                session_id=session_id,
+                runtime_manager=runtime_manager,
+                text_normalizer_manager=text_normalizer_manager,
+                warmup_manager=warmup_manager,
+                prompt_audio_path=prompt_audio_path,
+                prompt_audio_display_path=prompt_audio_display,
+                prompt_audio_cleanup_path=prompt_audio_cleanup,
+                segmenter=segmenter,
+                extra_tts_params=start_data.get("extra_tts_params") or {},
+                insert_inter_silence_ms=int(start_data.get("insert_inter_silence_ms", 120)),
+                on_audio=_on_audio,
+                on_sentence=_on_sentence,
+                on_error=_on_error,
+                on_ended=_on_ended,
+            )
+
+            # 超时兜底定时器
+            def _idle_timer_loop():
+                while not idle_timer_cancel.wait(0.2):
+                    if session is None or session.state in {"ended", "cancelled"}:
+                        break
+                    for seg in segmenter.check_idle_timeout():
+                        session._enqueue_segment(seg)  # noqa: SLF001
+
+            timer_thread = threading.Thread(target=_idle_timer_loop, name=f"agent-tts-idle-{session_id}", daemon=True)
+            timer_thread.start()
+
+            session.start()
+            await ws.send_json({
+                "type": "ready",
+                "session_id": session_id,
+                "sample_rate": session.sample_rate,
+                "channels": session.channels,
+                "codec": "pcm_s16le",
+            })
+
+            # 主接收循环
+            while True:
+                msg = await ws.receive()
+                if msg.get("type") == WebSocketDisconnect.__name__ or ws.client_state.name == "DISCONNECTED":
+                    break
+                text = msg.get("text")
+                if text is None:
+                    continue
+                try:
+                    data = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                mtype = str(data.get("type", ""))
+                if mtype == "text":
+                    session.feed_text(str(data.get("delta", "")))
+                elif mtype == "flush":
+                    session.flush()
+                elif mtype == "stop":
+                    session.stop()
+                    idle_timer_cancel.set()
+                    break
+                elif mtype == "cancel":
+                    session.cancel()
+                    idle_timer_cancel.set()
+                    break
+                elif mtype == "ping":
+                    await ws.send_json({"type": "pong"})
+
+            # 等待 send_loop 把剩余帧发完
+            try:
+                await asyncio.wait_for(send_task, timeout=30.0)
+            except asyncio.TimeoutError:
+                send_task.cancel()
+            await ws.close(code=1000)
+
+        except WebSocketDisconnect:
+            if session is not None:
+                session.cancel()
+            idle_timer_cancel.set()
+            send_task.cancel()
+        except Exception as exc:
+            logging.exception("agent-tts ws: handler error (session=%s)", session_id)
+            try:
+                await ws.send_json({"type": "error", "code": "internal", "message": str(exc), "fatal": True})
+            except Exception:
+                pass
+            try:
+                await ws.close(code=4002)
+            except Exception:
+                pass
+            if session is not None:
+                session.cancel()
+            idle_timer_cancel.set()
+            send_task.cancel()
 
     @app.post("/api/generate")
     async def generate(
