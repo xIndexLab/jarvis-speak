@@ -34,6 +34,7 @@ _DEFAULT_VOICE_FILES: dict[str, tuple[str, str]] = {
     "Ava": ("en_2.wav", "English female voice A"),
     "Bella": ("en_3.wav", "English female voice B"),
     "Adam": ("en_4.wav", "English male voice A"),
+    "Jarvis": ("jarvis.wav", "Jarvis custom voice (1.3x Adam)"),
     "Nathan": ("en_5.wav", "English male voice B"),
     "Sakura": ("jp_1.mp3", "Japanese female voice A"),
     "Yui": ("jp_2.wav", "Japanese female voice B"),
