@@ -30,6 +30,17 @@ from ort_cpu_runtime import _normalize_execution_provider, _resolve_stream_decod
 
 _LEGACY_RENDER_INDEX_HTML = legacy_app._render_index_html
 
+# ---- 静音 VAD 兜底截断 ----
+# 模型未吐 EOS 时，尾部连续静音达到阈值即主动中断帧生成循环。
+# 阈值按 float32 PCM [-1,1] 的 RMS 估计；仅当已产出过非静音音频后才累计（避免吞掉开头引导静音）。
+_VAD_SILENCE_RMS = 0.01
+_VAD_SILENCE_SECONDS = 0.6
+
+
+class _VadEarlyStop(Exception):
+    """静音 VAD 兜底截断：模型未吐 EOS 但尾部连续静音，主动中断 generate_audio_frames。"""
+
+
 
 class _OnnxDeviceInfo:
     def __init__(self, execution_provider: str) -> None:
@@ -249,6 +260,8 @@ class OnnxNanoTTSServiceAdapter:
         audio_top_k: int = 25,
         audio_repetition_penalty: float = 1.2,
         seed: int | None = None,
+        vad_silence_seconds: float = _VAD_SILENCE_SECONDS,
+        vad_silence_rms: float = _VAD_SILENCE_RMS,
     ) -> Iterator[dict[str, object]]:
         del mode, tts_max_batch_size, codec_max_batch_size
         event_queue: "queue.Queue[dict[str, object] | None]" = queue.Queue(maxsize=128)
@@ -285,9 +298,14 @@ class OnnxNanoTTSServiceAdapter:
                     pending_decode_frames: list[list[int]] = []
                     emitted_chunks: list[np.ndarray] = []
                     self.runtime.codec_streaming_session.reset()
+                    # VAD 状态：per-chunk 重置。has_speech 仅在产出过非静音音频后才开始计尾部静音，避免吞掉开头引导帧。
+                    vad_silence_acc = 0.0
+                    vad_has_speech = False
+                    vad_triggered = False
 
                     def _emit_waveform(waveform: np.ndarray, *, is_pause: bool) -> None:
                         nonlocal emitted_samples_total, first_audio_emitted_at_perf
+                        nonlocal vad_silence_acc, vad_has_speech, vad_triggered
                         audio_length = int(waveform.shape[0])
                         if first_audio_emitted_at_perf is None and not is_pause:
                             first_audio_emitted_at_perf = time.perf_counter()
@@ -309,6 +327,22 @@ class OnnxNanoTTSServiceAdapter:
                                 "is_pause": bool(is_pause),
                             }
                         )
+                        # ---- 静音 VAD 兜底：尾部连续静音达到阈值即标记截断 ----
+                        if (not is_pause) and vad_silence_seconds > 0 and (not vad_triggered):
+                            arr = emitted_chunks[-1]
+                            if arr.size > 0:
+                                rms = float(np.sqrt(np.mean(np.square(arr, dtype=np.float32))))
+                                if rms >= vad_silence_rms:
+                                    vad_has_speech = True
+                                    vad_silence_acc = 0.0
+                                elif vad_has_speech:
+                                    vad_silence_acc += audio_length / float(sample_rate)
+                                    if vad_silence_acc >= vad_silence_seconds:
+                                        vad_triggered = True
+                                        logging.info(
+                                            "onnx-synthesize-stream: VAD triggered (silence=%.2fs>=%.2fs, chunk=%s)",
+                                            vad_silence_acc, vad_silence_seconds, chunk_index,
+                                        )
 
                     def _decode_pending(force: bool) -> None:
                         pending_count = len(pending_decode_frames)
@@ -338,9 +372,17 @@ class OnnxNanoTTSServiceAdapter:
                     def _on_frame(_generated_frames: list[list[int]], _step_index: int, frame: list[int]) -> None:
                         pending_decode_frames.append(list(frame))
                         _decode_pending(False)
+                        # VAD 触发后中断 generate_audio_frames 帧循环（否则会一路跑到 max_new_frames 上限）
+                        if vad_triggered:
+                            raise _VadEarlyStop()
 
                     try:
                         generated_frames = self.runtime.generate_audio_frames(request_rows, on_frame=_on_frame)
+                        _decode_pending(True)
+                    except _VadEarlyStop:
+                        # VAD 截断：已生成帧保留，排空剩余 pending 解码后正常收尾该 chunk
+                        logging.info("onnx-synthesize-stream: VAD early-stopped generation (chunk=%s)", chunk_index)
+                        generated_frames = []
                         _decode_pending(True)
                     finally:
                         self.runtime.codec_streaming_session.reset()

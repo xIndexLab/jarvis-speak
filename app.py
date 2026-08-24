@@ -220,6 +220,7 @@ class WarmupManager:
             self._set_state(state="running", progress=0.6, message="Running startup warmup synthesis.", error=None)
             result = self.runtime.warmup()
             _maybe_delete_file(result["audio_path"])
+            wetext_ready = False
             if self.text_normalizer_manager is not None:
                 self._set_state(
                     state="running",
@@ -229,14 +230,23 @@ class WarmupManager:
                 )
                 normalization_snapshot = self.text_normalizer_manager.ensure_ready()
                 if normalization_snapshot.failed:
-                    raise RuntimeError(normalization_snapshot.error or normalization_snapshot.message)
+                    # WeTextProcessing is optional; degrade gracefully (text
+                    # normalization falls back to normalize_tts_text) instead of
+                    # failing the whole warmup. Lets the server run where
+                    # WeTextProcessing/pynini cannot be built (e.g. Intel macOS).
+                    logging.warning(
+                        "WeTextProcessing unavailable; continuing with it disabled: %s",
+                        normalization_snapshot.error or normalization_snapshot.message,
+                    )
+                else:
+                    wetext_ready = True
             self._set_state(
                 state="ready",
                 progress=1.0,
                 message=(
                     f"Warmup complete. device={self.runtime.device} "
                     f"elapsed={result['elapsed_seconds']:.2f}s"
-                    + (" | WeTextProcessing ready." if self.text_normalizer_manager is not None else "")
+                    + (" | WeTextProcessing ready." if wetext_ready else " | WeTextProcessing disabled.")
                 ),
                 error=None,
             )
@@ -685,6 +695,9 @@ _DEFAULT_AGENT_TTS_PARAMS: dict[str, object] = {
     "audio_repetition_penalty": 1.2,
     "seed": None,
     "cpu_threads": 0,
+    # 静音 VAD 兜底：尾部连续静音达到阈值即截断（0 禁用），避免模型不吐 EOS 时跑到 max_new_frames 上限
+    "vad_silence_seconds": 0.6,
+    "vad_silence_rms": 0.01,
 }
 
 
@@ -949,6 +962,8 @@ class TtsSession:
                 audio_top_k=int(params["audio_top_k"]),
                 audio_repetition_penalty=float(params["audio_repetition_penalty"]),
                 seed=params["seed"],
+                vad_silence_seconds=float(params["vad_silence_seconds"]),
+                vad_silence_rms=float(params["vad_silence_rms"]),
             )
 
         try:
@@ -3285,7 +3300,7 @@ def _build_app(
         if chunk.is_boundary:
             flags |= _WS_FLAG_BOUNDARY
         header = struct.pack(
-            ">BBBBIIB",
+            ">BBBIIB",
             _WS_AUDIO_MAGIC,
             _WS_AUDIO_VER,
             flags,
@@ -3349,6 +3364,15 @@ def _build_app(
                     # 客户端已断开，停止
                     break
 
+        def _put_blocking(item, timeout: float = 30.0) -> None:
+            """Deliver a control/terminal frame with backpressure so it is never
+            dropped under queue pressure (dropping `ended`/`error`/the None
+            sentinel would hang the client waiting for the stream to finish)."""
+            try:
+                out_queue.put(item, timeout=timeout)
+            except queue.Full:
+                logging.warning("agent-tts ws: out_queue full, gave up delivering control frame (session=%s)", session_id)
+
         def _on_audio(chunk: "_AgentAudioChunk"):
             try:
                 out_queue.put_nowait(_build_ws_audio_frame(chunk))
@@ -3362,17 +3386,12 @@ def _build_app(
                 pass
 
         def _on_error(message: str, fatal: bool):
-            try:
-                out_queue.put_nowait({"type": "error", "code": "fatal" if fatal else "warn", "message": message, "fatal": fatal})
-            except queue.Full:
-                pass
+            _put_blocking({"type": "error", "code": "fatal" if fatal else "warn", "message": message, "fatal": fatal}, timeout=5.0)
 
         def _on_ended(reason: str):
             # 发 ended + 末帧 is_last 标记 + 哨兵停止 send_loop
-            try:
-                out_queue.put_nowait({"type": "ended", "reason": reason})
-            except queue.Full:
-                pass
+            # 控制帧必须送达，否则客户端会一直等待流结束而挂起
+            _put_blocking({"type": "ended", "reason": reason})
             # 发一个 is_last 的空音频帧通知端结束
             end_chunk = _AgentAudioChunk(
                 pcm_bytes=b"",
@@ -3382,14 +3401,8 @@ def _build_app(
                 is_boundary=False,
                 is_silence=False,
             )
-            try:
-                out_queue.put_nowait(_build_ws_audio_frame(end_chunk, is_last=True))
-            except queue.Full:
-                pass
-            try:
-                out_queue.put_nowait(None)
-            except queue.Full:
-                pass
+            _put_blocking(_build_ws_audio_frame(end_chunk, is_last=True))
+            _put_blocking(None)
 
         send_task = asyncio.create_task(_send_loop())
 
