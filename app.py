@@ -22,9 +22,11 @@ from typing import Callable, Iterator, Optional, Sequence, TypeVar
 
 import numpy as np
 import torch
+import torchaudio
 import uvicorn
 from fastapi import FastAPI, File, Form, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
+from pydantic import BaseModel, Field
 
 from moss_tts_nano_runtime import (
     DEFAULT_AUDIO_TOKENIZER_PATH,
@@ -51,6 +53,19 @@ class DemoEntry:
     prompt_audio_path: Path
     prompt_audio_relative_path: str
     text: str
+
+
+class OpenAISpeechRequest(BaseModel):
+    """Request body for the OpenAI-compatible ``POST /v1/audio/speech`` endpoint."""
+
+    model: str = "moss-tts-nano"
+    input: str
+    voice: str = "Jarvis"
+    response_format: str = "wav"
+    speed: float = Field(default=1.0, ge=0.25, le=4.0)
+    # MOSS-specific extension: optional reference audio path (voice clone).
+    # When provided it overrides ``voice``.
+    prompt_audio_path: str | None = None
 
 
 def _load_demo_entries() -> list[DemoEntry]:
@@ -1142,6 +1157,62 @@ def _audio_to_pcm16le_bytes(audio_array) -> bytes:
     audio_np = np.clip(audio_np, -1.0, 1.0)
     audio_int16 = (audio_np * 32767.0).astype(np.int16)
     return audio_int16.tobytes()
+
+
+# OpenAI-compatible TTS: output 24 kHz signed int16 LE mono (per OpenAI audio/speech spec).
+_OPENAI_TTS_OUTPUT_SAMPLE_RATE = 24000
+
+
+def _waveform_to_openai_audio_bytes(
+    waveform_np: np.ndarray,
+    sample_rate: int,
+    response_format: str,
+    speed: float = 1.0,
+) -> bytes:
+    """Convert MOSS-TTS waveform (float32, multi-channel) to OpenAI audio/speech format.
+
+    OpenAI PCM: 24 kHz signed int16 little-endian mono.
+    OpenAI WAV: audio/wav container wrapping the same 24 kHz int16 mono PCM.
+
+    ``speed`` is approximated by resampling to (24000 / speed) Hz and emitting at
+    24 kHz, which scales playback duration by 1/speed. Pitch shifts proportionally
+    (no phase vocoder); acceptable for the typical 0.25–4.0 TTS range.
+    """
+    audio_np = np.asarray(waveform_np, dtype=np.float32)
+    if audio_np.ndim == 1:
+        audio_np = audio_np[:, None]
+    elif audio_np.ndim == 2 and audio_np.shape[0] <= 8 and audio_np.shape[0] < audio_np.shape[1]:
+        audio_np = audio_np.T
+    elif audio_np.ndim != 2:
+        raise ValueError(f"Unsupported audio array shape: {audio_np.shape}")
+
+    # down-mix to mono
+    mono = np.mean(audio_np, axis=1).astype(np.float32, copy=False)
+
+    # speed scaling via target sample rate
+    clamped_speed = float(max(0.25, min(4.0, float(speed))))
+    target_sr = int(round(_OPENAI_TTS_OUTPUT_SAMPLE_RATE / clamped_speed))
+
+    waveform_torch = torch.from_numpy(mono)
+    resampled = torchaudio.functional.resample(waveform_torch, int(sample_rate), target_sr).numpy()
+
+    resampled = np.clip(resampled, -1.0, 1.0)
+    pcm_int16 = (resampled * 32767.0).astype(np.int16)
+    pcm_bytes = pcm_int16.tobytes()
+
+    fmt = str(response_format or "wav").lower()
+    if fmt == "pcm":
+        return pcm_bytes
+
+    # default: wav (24 kHz, 16-bit, mono)
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(_OPENAI_TTS_OUTPUT_SAMPLE_RATE)
+        wav_file.writeframes(pcm_bytes)
+    buffer.seek(0)
+    return buffer.read()
 
 
 def _read_audio_file_base64(path_value: str | None) -> str:
@@ -3655,6 +3726,119 @@ def _build_app(
         finally:
             _maybe_delete_file(generated_audio_path)
             _maybe_delete_file(prompt_audio_cleanup_path)
+
+    # ------------------------------------------------------------------
+    # OpenAI-compatible TTS endpoint: POST /v1/audio/speech
+    # Allows external clients (e.g. huggingface/speech-to-speech with
+    # `--tts openai`) to use MOSS-TTS-Nano as a drop-in TTS backend.
+    # ------------------------------------------------------------------
+    @app.post("/v1/audio/speech")
+    async def openai_audio_speech(req: OpenAISpeechRequest):
+        text = str(req.input or "").strip()
+        if not text:
+            return JSONResponse(status_code=400, content={"error": "input text is required"})
+
+        warmup_snapshot = warmup_manager.snapshot()
+        if not warmup_snapshot.ready:
+            warmup_snapshot = warmup_manager.ensure_ready()
+            if not warmup_snapshot.ready:
+                return JSONResponse(status_code=503, content={"error": _warmup_status_text(warmup_snapshot)})
+
+        try:
+            prepared_texts = shared_prepare_tts_request_texts(
+                text=text,
+                enable_wetext=False,
+                enable_normalize_tts_text=True,
+                text_normalizer_manager=text_normalizer_manager,
+            )
+        except Exception:
+            prepared_texts = {"text": text}
+
+        prompt_audio_path = str(req.prompt_audio_path).strip() if req.prompt_audio_path else None
+        voice = str(req.voice or "Jarvis").strip() if not prompt_audio_path else None
+
+        # Use the streaming path so the silence-VAD fallback can cut
+        # over-generation (short texts often fail to emit EOS). Collect all
+        # emitted audio chunks and concatenate into one waveform.
+        def _stream_factory(selected_runtime: NanoTTSService):
+            base_kwargs: dict[str, object] = dict(
+                text=str(prepared_texts.get("text", text)),
+                mode="voice_clone",
+                voice=voice,
+                prompt_audio_path=prompt_audio_path,
+                max_new_frames=375,
+                voice_clone_max_text_tokens=75,
+                tts_max_batch_size=0,
+                codec_max_batch_size=0,
+                attn_implementation=_resolve_attn_for_runtime(selected_runtime, "model_default"),
+                do_sample=True,
+                text_temperature=1.0,
+                text_top_p=1.0,
+                text_top_k=50,
+                audio_temperature=0.8,
+                audio_top_p=0.95,
+                audio_top_k=25,
+                audio_repetition_penalty=1.2,
+                seed=None,
+            )
+            # VAD fallback is only available on the ONNX adapter; pass it
+            # only when the backend declares the parameter.
+            try:
+                import inspect
+
+                params = inspect.signature(selected_runtime.synthesize_stream).parameters
+            except (TypeError, ValueError):
+                params = {}
+            if "vad_silence_seconds" in params:
+                base_kwargs["vad_silence_seconds"] = 0.6
+                base_kwargs["vad_silence_rms"] = 0.01
+            return selected_runtime.synthesize_stream(**base_kwargs)
+
+        collected: list[np.ndarray] = []
+        sample_rate = 24000
+        try:
+            for event, _resolved_device, _resolved_cpu_threads in runtime_manager.iter_with_runtime(
+                requested_execution_device="cpu",
+                cpu_threads=0,
+                factory=_stream_factory,
+            ):
+                if str(event.get("type", "")) != "audio":
+                    continue
+                if bool(event.get("is_pause", False)):
+                    continue
+                wf = np.asarray(event["waveform_numpy"], dtype=np.float32)
+                if wf.size == 0:
+                    continue
+                sample_rate = int(event.get("sample_rate", sample_rate))
+                collected.append(wf)
+        except Exception as exc:
+            logging.exception("OpenAI-compatible TTS synthesis failed")
+            return JSONResponse(status_code=500, content={"error": str(exc)})
+
+        if not collected:
+            return JSONResponse(status_code=500, content={"error": "no audio was generated"})
+
+        waveform = np.concatenate(collected, axis=0)
+
+        try:
+            audio_bytes = _waveform_to_openai_audio_bytes(
+                waveform, sample_rate, req.response_format, req.speed
+            )
+        except Exception as exc:
+            logging.exception("OpenAI-compatible TTS audio conversion failed")
+            return JSONResponse(status_code=500, content={"error": str(exc)})
+
+        media_types = {
+            "wav": "audio/wav",
+            "pcm": "audio/pcm",
+            "mp3": "audio/mpeg",
+            "opus": "audio/opus",
+            "aac": "audio/aac",
+            "flac": "audio/flac",
+        }
+        fmt = str(req.response_format or "wav").lower()
+        media_type = media_types.get(fmt, "audio/wav")
+        return Response(content=audio_bytes, media_type=media_type)
 
     return app
 
